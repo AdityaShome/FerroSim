@@ -131,4 +131,92 @@ locked" as the headline framing of FerroSim's GPU differentiation rather than "b
 GPU" alone (since NVIDIA has now demonstrated batched GPU neighbor lists are
 achievable, if CUDA-locked).
 
+## Phase 1 — Core algorithm: correct, single-system, CPU neighbor lists in Rust
+
+### 2026-08-05 — Core data structures and design
+- `cargo init --lib`; crate structure: `cell.rs` (lattice matrix + fractional/Cartesian
+  conversion), `system.rs` (flat position array + cell + PBC flags), `neighbor_list.rs`
+  (output type), `bruteforce.rs` (O(n²) reference), `celllist.rs` (the real algorithm).
+- Positions are a flat `Vec<f64>` (length `3*n_atoms`), not `Vec<[f64;3]>`, per
+  project.md's explicit performance guidance.
+- `NeighborList` output matches ASE/torch_nl's `i, j, S` convention (parallel index
+  arrays + integer periodic-shift vectors) for drop-in compatibility, and is always a
+  *full* list (`(i,j,S)` and `(j,i,-S)` both present) since MLIP force/energy
+  calculations need each atom's complete neighbor set.
+- Triclinic cells are sized using **perpendicular width** (`V / face_area` per axis, not
+  axis-aligned bounding box) — the standard technique for correctly sizing cell-list
+  bins in skewed cells, since a naive bounding box either wastes bins or misses
+  neighbors depending on skew direction.
+- Brute-force reference implemented independently of the cell-list's fractional/binning
+  machinery (works directly in raw Cartesian coordinates) specifically so the two
+  algorithms are a genuine cross-check on each other, not two paths through the same bug.
+
+### 2026-08-05 — Two real correctness bugs found and fixed via the brute-force cross-check
+Writing `tests/correctness.rs` (property tests: random orthogonal/triclinic/mixed-PBC
+configs, edge cases) immediately surfaced two bugs — exactly the kind of thing the
+brute-force oracle exists to catch:
+
+1. **Brute-force self-pair double-count.** For `i == j`, the reference's shift loop
+   visits both `+shift` and `-shift` as separate iterations, but the code also manually
+   pushed the mirror `(j,i,-shift)` on every match — double-counting every periodic
+   self-image pair. Fixed by only pushing once when `i == j`.
+2. **Cell-list shift-reconstruction bug (the real algorithmic bug).** The formula used
+   to reconstruct the periodic shift `S` for a found pair was `S = bin_shift -
+   floor(frac_j)`, missing a `+ floor(frac_i)` term. This is invisible whenever all
+   input positions already lie inside `[0,1)` fractional coordinates (floor = 0 for
+   everyone, e.g. any test that generates positions in `[0, cell_side)` for an
+   axis-aligned cell) — which is why initial orthogonal/mixed-PBC tests passed while
+   masking the bug. It only surfaces for atoms whose fractional coordinate falls outside
+   `[0,1)` before wrapping (raw input spanning more than one periodic image), which the
+   triclinic random test happened to generate. Root cause: `bin_shift` is computed
+   relative to atom `i`'s *wrapped* (canonical, floor-removed) bin position, not its true
+   fractional position, so the reconstructed shift needs correcting by both atoms'
+   removed floors, not just atom `j`'s.
+3. **Follow-on brute-force bug, same root cause.** After fixing (2), one triclinic
+   random-trial case still disagreed: the brute-force reference's `n_shell` bound
+   (`ceil(cutoff/perp)`) is only valid for positions pre-wrapped into `[0,1)` — it
+   doesn't account for raw input atoms already starting more than one cell apart. Fixed
+   by padding `n_shell` with the actual fractional-coordinate span of the input data per
+   axis, keeping the reference dead-simple (just widen the search window) rather than
+   adopting the cell-list's wrap-and-correct machinery.
+
+**Lesson for the rest of the project:** test position generators must include cases
+where fractional coordinates fall outside `[0,1)` (unwrapped/raw input) — this is not an
+edge case in practice (MD trajectories routinely drift atoms outside the nominal cell
+between wraps) and both implementations independently got it wrong until an explicit
+`atoms_outside_fundamental_domain` regression test was added.
+
+**Result:** all 12 correctness tests pass (`cargo test`), including 50-trial randomized
+sweeps over orthogonal, triclinic, and mixed-PBC configurations, plus explicit edge
+cases (single atom, exact-cutoff-boundary, small-cell-large-cutoff, sparse systems,
+non-periodic clusters, unwrapped input). Phase 1's correctness gate is met.
+
+### 2026-08-05 — Task 5: initial single-system benchmark vs Vesin/torch_nl/ASE
+`examples/bench_fcc.rs` (`cargo run --release --example bench_fcc`) reconstructs the
+identical FCC Cu supercells used in Phase 0's `scripts/bench_competitors.py` (cubic
+`bulk("Cu","fcc",a=3.6)` repeated to hit the same atom counts, 6 Å cutoff, best-of-7
+timing), so the numbers are directly comparable to the Phase 0 table above:
+
+| n_atoms | ASE (s) | Vesin (s) | torch_nl (s) | **FerroSim (s)** |
+|--------:|--------:|----------:|--------------:|------------------:|
+|      32 | 0.01687 |   0.00042 |       0.00340 |        **0.00020** |
+|     500 | 0.06666 |   0.00080 |       0.02995 |        **0.00262** |
+|    2048 | 0.44023 |   0.00453 |       0.13943 |        **0.01364** |
+
+**Interpretation:** FerroSim already beats ASE (~85-320x) and torch_nl (~10-17x) at
+every size, unsurprising since neither is a tuned, allocation-lean, compiled cell-list
+core (ASE's is pure Python; torch_nl carries tensor/batch overhead designed for
+autodiff, not raw speed). Against Vesin specifically — the actual bar per Phase 0 —
+FerroSim is *faster* at the smallest size (32 atoms: 2.1x) but *3.0-3.3x slower* at
+500 and 2048 atoms. Plausible causes, to investigate in Phase 2 rather than now: (a)
+`HashMap<(i32,i32,i32), Vec<usize>>` binning has hashing + allocation overhead per bin
+that a flat/sorted array binning scheme (which Vesin's Rust core reportedly uses) would
+avoid; (b) no parallelism yet (Phase 2's explicit `rayon` task); (c) recomputing
+`cell.cartesian(shift)` per candidate pair inside the innermost loop instead of
+precomputing the small set of possible shift vectors once. This is judged a "close, not
+dramatic" gap per the Phase 1 gate language (large gaps = algorithmic issue; this is a
+missing-optimization-scale gap, ~3x, not ASE's 40-100x or even torch_nl's double-digit
+gap) — proceeding to Phase 2 as scoped, with the above three items as concrete first
+optimization targets rather than a full redesign.
+
 <!-- Append further entries below as Phase 0 tasks proceed. -->
