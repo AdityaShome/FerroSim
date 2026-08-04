@@ -219,4 +219,103 @@ missing-optimization-scale gap, ~3x, not ASE's 40-100x or even torch_nl's double
 gap) — proceeding to Phase 2 as scoped, with the above three items as concrete first
 optimization targets rather than a full redesign.
 
+## Phase 2 — Performance optimization + batched multi-system execution
+
+### 2026-08-05 — Task 1: `rayon`-parallelized single-system search
+Refactored `celllist.rs` into `build_bin_grid` (sequential — O(n), binning atoms into
+a `HashMap<(i32,i32,i32), Vec<usize>>`) and `neighbors_for_atom` (a pure function of
+`(system, cutoff, grid, atom index)`, no shared mutable state), then parallelized the
+per-atom search itself via `(0..n).into_par_iter().flat_map_iter(...)`. Binning stays
+sequential — it's O(n) and cheap relative to the O(n·shell³) search, and a shared
+mutable `HashMap` isn't worth parallelizing carefully for the gain.
+
+Scaling on the 12-logical-core dev machine (`examples/bench_fcc.rs`, `RAYON_NUM_THREADS`
+forced via env var, FCC Cu, 6 Å cutoff, release build, best-of-7):
+
+| n_atoms | 1 thread (s) | 2 (s) | 4 (s) | 8 (s) | 12 (s) | speedup (1→12) |
+|--------:|-------------:|------:|------:|------:|-------:|----------------:|
+|      32 |      0.00042 | 0.00027 | 0.00023 | 0.00018 | 0.00016 |            2.6x |
+|     500 |      0.00383 | 0.00293 | 0.00212 | 0.00175 | 0.00179 |            2.1x |
+|    2048 |      0.01826 | 0.01122 | 0.00717 | 0.00617 | 0.00598 |            3.1x |
+
+**Interpretation:** scaling is real but far from linear (~3x on 12 cores, not 12x) at
+every tested size — this is expected and *not* treated as a bug per se, but is a
+concrete area to revisit: likely causes are (a) `flat_map_iter` allocating a `Vec` per
+atom then concatenating, rather than a lock-free/pre-sized shared output buffer, (b) the
+shared `HashMap` bin lookups causing cache-line contention across threads even though
+there's no write contention, (c) work granularity — 2048 atoms split across 12 rayon
+tasks may not be enough work per task to amortize scheduling overhead. Not chasing this
+further right now since Task 2 (batching) is the actual differentiator; batching should
+also improve core utilization by giving rayon many independent systems' worth of work
+to schedule instead of subdividing one system's atom loop.
+
+Re-checked against the Phase 1 Vesin baseline at 12 threads: 32 atoms FerroSim is now
+2.6x *faster* than Vesin (was 2.1x single-threaded), 500 atoms 2.2x slower (was 3.3x),
+2048 atoms only 1.3x slower (was 3.0x) — parallelism alone closed most of the Phase 1
+gap at the largest tested size.
+
+### 2026-08-05 — Task 2: batched multi-system API (`src/batch.rs`)
+`compute_neighbor_lists_batched(&[System], cutoff)` builds each system's bin grid
+(parallelized across systems via `rayon`, cheap relative to search), then flattens
+*every system's per-atom search* into one `rayon` parallel iteration spanning the whole
+batch, rather than looping the single-system function per system. This matters
+specifically because the target workload is many *small* systems (Phase 0's core
+differentiation angle) — subdividing one 32-atom system's own atom loop across 12
+threads (as the single-system path does) starves the thread pool with too little work
+per task, but flattening 128 systems × 32 atoms = 4096 independent search tasks into one
+pool gives rayon plenty of granular, independent work regardless of individual system
+size. Verified against the single-system path (`tests/batch.rs`): batched output must
+exactly equal per-system looped `compute_neighbor_list` output, including empty-batch
+and zero-atom-system edge cases.
+
+### 2026-08-05 — Task 3: incremental Verlet-list updates (`src/verlet.rs`)
+`VerletList::new(system, cutoff, skin)` builds a candidate pair list once at an extended
+cutoff (`cutoff + skin`); `VerletList::update(system)` recomputes distances only for
+those existing candidates (cheap) and only rebuilds the candidate set (full cell-list
+recompute at `cutoff + skin`) when some atom has moved more than `skin / 2` since the
+last rebuild. Correctness rests on a standard triangle-inequality argument (documented
+in the module): if every atom moves at most `skin / 2`, any pair's separation can change
+by at most `skin`, so a pair excluded from the `cutoff + skin` candidate set cannot have
+entered `cutoff`, and nothing within `cutoff` can be missing from candidates — this is
+why the trigger is `skin / 2` per atom, not `skin`.
+
+Tested (`tests/verlet.rs`) via: (a) a hand-worked exact case checking the rebuild flag
+fires precisely when cumulative displacement crosses `skin/2` and not before; (b) a
+40-step random-trajectory property test mixing small per-atom steps (expected: no
+rebuild) with occasional large single-atom jumps (expected: rebuild), asserting the
+incremental result exactly equals a fresh full `compute_neighbor_list` call at *every*
+step regardless of which path was taken — this is the actual correctness invariant a
+Verlet list exists to preserve, not just "doesn't crash"; (c) `skin = 0.0` degrading to
+rebuild-every-call, confirming the trigger's boundary behavior.
+
+### 2026-08-05 — Task 5: batched-workload benchmark vs Vesin/torch_nl
+`scripts/bench_batch_competitors.py` / `examples/bench_batch_fcc.rs`: batches of 8/32/128
+independent 32-atom FCC Cu cells, 6 Å cutoff. ASE and Vesin have no native batching API
+so are benchmarked as a Python loop (their natural usage for this workload); torch_nl has
+a native `batch` tensor argument processing the whole batch in one call, benchmarked that
+way (its actual intended fast path):
+
+| batch_size | ASE looped (s) | Vesin looped (s) | torch_nl batched (s) | **FerroSim batched (s)** |
+|-----------:|----------------:|-------------------:|-----------------------:|----------------------------:|
+|          8 |         0.14339 |             0.00219 |                 0.02034 |                  **0.00104** |
+|         32 |         0.54510 |             0.00795 |                 0.07656 |                  **0.00317** |
+|        128 |         1.80146 |             0.03024 |                 0.34305 |                  **0.01408** |
+
+**Interpretation:** this is the headline result Phase 0 predicted. On the single-system
+benchmark (Phase 1/Task 1 above), FerroSim trailed Vesin by up to 3x; on the *batched*
+workload — the actual MLIP training/inference shape — FerroSim is now **2.1-2.5x faster
+than Vesin at every batch size tested**, because Vesin's per-call Python-loop overhead
+and lack of cross-system parallelism don't amortize the way FerroSim's single flattened
+`rayon` dispatch across the whole batch does. Also notable: torch_nl's "batched" call
+(its actual native batching path, not a loop) scales almost exactly linearly with batch
+size (8→32→128 is a ~4x/~4.5x time increase for a 4x systems increase both times) with
+no evidence of sub-linear scaling from batching — this confirms the Phase 0 suspicion
+("worth checking whether torch_nl actually batches efficiently... or just loops
+internally") that torch_nl's batch API does not meaningfully parallelize across systems
+on CPU. **Phase 2's core differentiation claim is empirically validated**: FerroSim's
+batched execution shows a clear efficiency advantage over both a naive per-system loop
+(Vesin) and a competitor's own native batching path (torch_nl) — the Phase 2 gate
+("batched execution must show a clear efficiency advantage over naively looping the
+single-system implementation") is met.
+
 <!-- Append further entries below as Phase 0 tasks proceed. -->

@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use rayon::prelude::*;
+
 use crate::neighbor_list::NeighborList;
 use crate::system::System;
 
@@ -21,22 +23,20 @@ fn wrap_axis(idx: i32, n_bins: i32, periodic: bool) -> Option<(i32, i32)> {
     }
 }
 
-/// Fast cell-list (spatial hashing) neighbor-list construction: partitions
-/// the simulation cell into a grid of bins sized to the cutoff radius (via
-/// the cell's perpendicular widths, so triclinic cells are handled
-/// correctly), bins atoms in O(n), then only checks neighbor candidates in
-/// adjacent bins rather than all pairs.
-///
-/// Produces a full list (both `(i, j, S)` and `(j, i, -S)`), matching
-/// `bruteforce::compute_neighbor_list_bruteforce`'s convention.
-pub fn compute_neighbor_list(system: &System, cutoff: f64) -> NeighborList {
-    assert!(cutoff > 0.0, "cutoff must be positive");
-    let n = system.n_atoms();
-    let mut nl = NeighborList::default();
-    if n == 0 {
-        return nl;
-    }
+/// Immutable spatial-binning state shared read-only across worker threads:
+/// which bin each atom falls in, how many bin-shells to search per axis, and
+/// the integer floor removed from each atom's fractional coordinate when it
+/// was wrapped into `[0, 1)` (needed to reconstruct true periodic shifts).
+pub(crate) struct BinGrid {
+    num_bins: [usize; 3],
+    shell: [i32; 3],
+    bins: HashMap<(i32, i32, i32), Vec<usize>>,
+    atom_bin: Vec<[i32; 3]>,
+    floor_coord: Vec<[i32; 3]>,
+}
 
+pub(crate) fn build_bin_grid(system: &System, cutoff: f64) -> BinGrid {
+    let n = system.n_atoms();
     let frac: Vec<[f64; 3]> = (0..n).map(|a| system.cell.fractional(system.position(a))).collect();
     let perp = system.cell.perpendicular_widths();
 
@@ -98,60 +98,99 @@ pub fn compute_neighbor_list(system: &System, cutoff: f64) -> NeighborList {
         bins.entry((idx[0], idx[1], idx[2])).or_default().push(a);
     }
 
-    let cutoff_sq = cutoff * cutoff;
+    BinGrid { num_bins, shell, bins, atom_bin, floor_coord }
+}
 
-    for i in 0..n {
-        let bi = atom_bin[i];
-        let pi = system.position(i);
-        for d0 in -shell[0]..=shell[0] {
-            let Some((nb0, bshift0)) = wrap_axis(bi[0] + d0, num_bins[0] as i32, system.pbc[0])
+/// All neighbors of atom `i` within `cutoff`, searched via `grid`. Pure
+/// function of `(system, cutoff, grid, i)` — no shared mutable state — so it
+/// can run independently per atom across threads.
+pub(crate) fn neighbors_for_atom(
+    system: &System,
+    cutoff_sq: f64,
+    grid: &BinGrid,
+    i: usize,
+) -> Vec<(u32, u32, [i32; 3])> {
+    let mut out = Vec::new();
+    let bi = grid.atom_bin[i];
+    let pi = system.position(i);
+    for d0 in -grid.shell[0]..=grid.shell[0] {
+        let Some((nb0, bshift0)) = wrap_axis(bi[0] + d0, grid.num_bins[0] as i32, system.pbc[0])
+        else {
+            continue;
+        };
+        for d1 in -grid.shell[1]..=grid.shell[1] {
+            let Some((nb1, bshift1)) =
+                wrap_axis(bi[1] + d1, grid.num_bins[1] as i32, system.pbc[1])
             else {
                 continue;
             };
-            for d1 in -shell[1]..=shell[1] {
-                let Some((nb1, bshift1)) =
-                    wrap_axis(bi[1] + d1, num_bins[1] as i32, system.pbc[1])
+            for d2 in -grid.shell[2]..=grid.shell[2] {
+                let Some((nb2, bshift2)) =
+                    wrap_axis(bi[2] + d2, grid.num_bins[2] as i32, system.pbc[2])
                 else {
                     continue;
                 };
-                for d2 in -shell[2]..=shell[2] {
-                    let Some((nb2, bshift2)) =
-                        wrap_axis(bi[2] + d2, num_bins[2] as i32, system.pbc[2])
-                    else {
-                        continue;
-                    };
 
-                    let Some(atoms) = bins.get(&(nb0, nb1, nb2)) else {
+                let Some(atoms) = grid.bins.get(&(nb0, nb1, nb2)) else {
+                    continue;
+                };
+                for &j in atoms {
+                    // `bshift` is relative to atom i's *wrapped* (canonical,
+                    // floor-removed) position, not its true fractional position —
+                    // so it must be corrected by both atoms' removed floors to give
+                    // the true periodic shift between the actual atom positions.
+                    let s = [
+                        bshift0 - grid.floor_coord[j][0] + grid.floor_coord[i][0],
+                        bshift1 - grid.floor_coord[j][1] + grid.floor_coord[i][1],
+                        bshift2 - grid.floor_coord[j][2] + grid.floor_coord[i][2],
+                    ];
+                    if i == j && s == [0, 0, 0] {
                         continue;
-                    };
-                    for &j in atoms {
-                        // `bshift` is relative to atom i's *wrapped* (canonical,
-                        // floor-removed) position, not its true fractional position —
-                        // so it must be corrected by both atoms' removed floors to give
-                        // the true periodic shift between the actual atom positions.
-                        let s = [
-                            bshift0 - floor_coord[j][0] + floor_coord[i][0],
-                            bshift1 - floor_coord[j][1] + floor_coord[i][1],
-                            bshift2 - floor_coord[j][2] + floor_coord[i][2],
-                        ];
-                        if i == j && s == [0, 0, 0] {
-                            continue;
-                        }
-                        let pj = system.position(j);
-                        let shift_cart =
-                            system.cell.cartesian([s[0] as f64, s[1] as f64, s[2] as f64]);
-                        let dx = pj[0] + shift_cart[0] - pi[0];
-                        let dy = pj[1] + shift_cart[1] - pi[1];
-                        let dz = pj[2] + shift_cart[2] - pi[2];
-                        let dist_sq = dx * dx + dy * dy + dz * dz;
-                        if dist_sq <= cutoff_sq {
-                            nl.push(i as u32, j as u32, s);
-                        }
+                    }
+                    let pj = system.position(j);
+                    let shift_cart = system.cell.cartesian([s[0] as f64, s[1] as f64, s[2] as f64]);
+                    let dx = pj[0] + shift_cart[0] - pi[0];
+                    let dy = pj[1] + shift_cart[1] - pi[1];
+                    let dz = pj[2] + shift_cart[2] - pi[2];
+                    let dist_sq = dx * dx + dy * dy + dz * dz;
+                    if dist_sq <= cutoff_sq {
+                        out.push((i as u32, j as u32, s));
                     }
                 }
             }
         }
     }
+    out
+}
 
+/// Fast cell-list (spatial hashing) neighbor-list construction: partitions
+/// the simulation cell into a grid of bins sized to the cutoff radius (via
+/// the cell's perpendicular widths, so triclinic cells are handled
+/// correctly), bins atoms in O(n), then only checks neighbor candidates in
+/// adjacent bins rather than all pairs. The per-atom search is parallelized
+/// across the Rayon global thread pool (binning itself stays sequential —
+/// it's O(n) and fast relative to the O(n * shell^3) search).
+///
+/// Produces a full list (both `(i, j, S)` and `(j, i, -S)`), matching
+/// `bruteforce::compute_neighbor_list_bruteforce`'s convention.
+pub fn compute_neighbor_list(system: &System, cutoff: f64) -> NeighborList {
+    assert!(cutoff > 0.0, "cutoff must be positive");
+    let n = system.n_atoms();
+    if n == 0 {
+        return NeighborList::default();
+    }
+
+    let grid = build_bin_grid(system, cutoff);
+    let cutoff_sq = cutoff * cutoff;
+
+    let pairs: Vec<(u32, u32, [i32; 3])> = (0..n)
+        .into_par_iter()
+        .flat_map_iter(|i| neighbors_for_atom(system, cutoff_sq, &grid, i))
+        .collect();
+
+    let mut nl = NeighborList::default();
+    for (i, j, s) in pairs {
+        nl.push(i, j, s);
+    }
     nl
 }
