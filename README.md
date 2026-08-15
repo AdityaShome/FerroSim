@@ -24,7 +24,39 @@ Python bindings, ASE integration, and the real MACE speedup case study (Phase 3'
 - **Triclinic cells handled correctly**, including atoms whose fractional coordinates fall outside `[0,1)` (unwrapped trajectory data) a case that silently breaks naive implementations (see the Phase 1 bugs in the decision log).
 - **Rust-native**, usable without a Python/PyTorch process Python bindings (planned) will be a thin wrapper over this core, not the other way around.
 
+## How it works
+
+Neighbor-list construction (single-system, batched CPU, and batched GPU all share the same binning idea, they differ in how the per-atom search is dispatched):
+
+```mermaid
+flowchart TD
+    A["System(s): positions, cell, pbc"] --> B["Bin atoms into cell-list grid (CPU, O(n))"]
+    B --> C{"single system, batched CPU, or batched GPU?"}
+    C -->|single system| D["rayon: parallel search per atom"]
+    C -->|batched CPU| E["rayon: parallel search across every atom in the whole batch"]
+    C -->|batched GPU| F["Flatten batch into CSR bin layout, per-system bin_offset"]
+    F --> G["Upload buffers to wgpu"]
+    G --> H["Compute shader: one thread per atom across the whole batch"]
+    H --> I["Two-phase readback: count first, then only the valid pair prefix"]
+    D --> J["NeighborList: i, j, shift"]
+    E --> J
+    I --> J
+```
+
+Incremental Verlet-list updates avoid a full rebuild every trajectory step unless the geometry has actually moved enough to risk missing a pair:
+
+```mermaid
+flowchart TD
+    A["VerletList::update(system)"] --> B{"Has any atom moved more than skin / 2 since the last rebuild?"}
+    B -->|no| C["Reuse existing candidate set, recompute distances only"]
+    B -->|yes| D["Full rebuild: cell-list search at cutoff + skin"]
+    C --> E["Return NeighborList, rebuilt = false"]
+    D --> F["Return NeighborList, rebuilt = true"]
+```
+
 ## Quickstart
+
+Run `cargo run --release --example demo` for a runnable tour of the whole API (single-system, batched CPU, batched GPU with a live CPU/GPU parity check and an incremental Verlet-list trajectory) with readable output. The snippets below are the same calls, walked through individually.
 
 ```rust
 use ferrosim::{compute_neighbor_list, Cell, System};
