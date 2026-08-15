@@ -28,11 +28,11 @@ fn wrap_axis(idx: i32, n_bins: i32, periodic: bool) -> Option<(i32, i32)> {
 /// the integer floor removed from each atom's fractional coordinate when it
 /// was wrapped into `[0, 1)` (needed to reconstruct true periodic shifts).
 pub(crate) struct BinGrid {
-    num_bins: [usize; 3],
-    shell: [i32; 3],
-    bins: HashMap<(i32, i32, i32), Vec<usize>>,
-    atom_bin: Vec<[i32; 3]>,
-    floor_coord: Vec<[i32; 3]>,
+    pub(crate) num_bins: [usize; 3],
+    pub(crate) shell: [i32; 3],
+    pub(crate) bins: HashMap<(i32, i32, i32), Vec<usize>>,
+    pub(crate) atom_bin: Vec<[i32; 3]>,
+    pub(crate) floor_coord: Vec<[i32; 3]>,
 }
 
 pub(crate) fn build_bin_grid(system: &System, cutoff: f64) -> BinGrid {

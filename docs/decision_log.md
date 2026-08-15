@@ -318,4 +318,118 @@ batched execution shows a clear efficiency advantage over both a naive per-syste
 ("batched execution must show a clear efficiency advantage over naively looping the
 single-system implementation") is met.
 
-<!-- Append further entries below as Phase 0 tasks proceed. -->
+## Phase 3 — GPU path (`wgpu`), Python bindings, MACE integration
+
+### 2026-08-15 — Task: hardware discovery and `wgpu` adapter probe
+Phase 0's "no CUDA available" finding was about the PyTorch build being CPU-only, not
+an absence of GPU hardware — worth re-checking before assuming the GPU angle was dead.
+`examples/gpu_probe.rs` (`cargo run --example gpu_probe`) enumerates `wgpu` adapters
+directly and confirms this machine has two: an integrated AMD Radeon (Vulkan/DX12/GL)
+and a discrete NVIDIA GeForce RTX 3050 Laptop GPU (Vulkan/DX12). `wgpu` selects the RTX
+3050 via Vulkan with `PowerPreference::HighPerformance` and creates a device+queue
+successfully — the GPU angle from project.md is viable on this dev machine after all.
+
+### 2026-08-15 — `wgpu` 30.0.0 API surface notes
+`wgpu` 30.0.0's API has moved significantly from older/more commonly-documented
+versions, found via iterative build failures and confirmed by reading the vendored
+crate source directly (`~/.cargo/registry/.../wgpu-30.0.0/src`) rather than guessing
+repeatedly:
+- `Instance::new()` takes an owned `InstanceDescriptor` (no `Default` impl) — use
+  `InstanceDescriptor::new_without_display_handle()`.
+- `enumerate_adapters()` / `request_adapter()` are `async fn`s now — bridged into
+  FerroSim's synchronous API via `pollster::block_on`.
+- `PipelineLayoutDescriptor.bind_group_layouts` is `&[Option<&BindGroupLayout>]`; push
+  constants were renamed "immediate data" (`immediate_size: u32`, no
+  `push_constant_ranges` field).
+- `Device::poll()` takes the struct variant `PollType::Wait { submission_index: None,
+  timeout: None }`.
+- `BufferSlice::get_mapped_range()` now returns `Result<BufferView, MapRangeError>`.
+
+### 2026-08-15 — GPU batched design: binning on CPU, search on GPU
+Only the O(n·shell³) per-atom neighbor search is ported to the GPU (`src/shaders/
+celllist.wgsl`); binning stays on the CPU (`build_bin_grid`, already O(n) and cheap)
+and is flattened into a CSR (compressed sparse row) layout (`bin_start`/`bin_atoms`)
+that the shader can index directly. One thread runs per atom across the **whole
+flattened batch** (mirroring Phase 2's `rayon` batching strategy), not one dispatch per
+system, so a batch of many small systems still saturates the GPU. Each system's bins
+occupy a disjoint "global bin id" range via a per-system `bin_offset`; critically, each
+system's `bin_start` segment needs `volume + 1` entries (not `volume`) since the
+shader's `bin_start[global_bin + 1]` lookup needs a trailing sentinel to know where the
+last bin's atom list ends — missing this was the first bug caught during
+implementation (via self-review, before any test was run): `bin_offset` was initially
+computed from cumulative bin volume alone, which would have made every system after the
+first read its bin ranges from the wrong offset.
+
+Variable-length pair output uses an atomic counter (`atomicAdd(&out_count, 1u)`) into a
+fixed-capacity `out_pairs` buffer sized from a generous per-atom pair-count guess, with
+automatic host-side retry (doubling the buffer) if the guess is exceeded.
+
+### 2026-08-15 — Correctness validated (`tests/gpu.rs`)
+GPU output (via `compute_neighbor_lists_batched_gpu`) is checked against the CPU
+batched path (already validated against brute-force in Phase 1) across: 25 randomized
+systems (orthogonal, triclinic, mixed-PBC), the same FCC Cu supercell batch used in
+benchmarking, an empty batch, and a deliberately dense system chosen to force the
+overflow-retry path. All 4 tests pass. The GPU shader uses `f32` (CPU path uses `f64`)
+as a deliberate throughput/precision tradeoff typical of GPU compute; test position
+generators are random-continuous rather than exact-cutoff-boundary specifically so this
+precision difference can't cause flaky failures while still being a real correctness
+check (not just "doesn't crash").
+
+### 2026-08-15 — Two performance bugs found via honest benchmarking, not assumed away
+`examples/bench_gpu_batch_fcc.rs` (FCC Cu, 32 atoms/system, 6 Å cutoff, warm-up call
+excluded from timing, best-of-7) initially showed the GPU path slower than the CPU
+`rayon` path at *every* batch size tested, with the gap *widening* at larger scale —
+the opposite of what GPU compute should do. Rather than accept or rationalize this,
+added temporary timing instrumentation to isolate where time was going, and found two
+concrete causes:
+
+1. **Retry loop firing on every call.** The initial `max_output_pairs` guess
+   (`n_atoms_total * 60`) undershot the real pair density: FCC Cu at a 6 Å cutoff has
+   ~78 pairs/atom across ~5 coordination shells, so every single call paid for a wasted
+   first dispatch + full readback before retrying with a doubled buffer. Fixed by
+   raising the default multiplier to `* 150`.
+2. **Full-buffer readback regardless of actual pair count (the dominant cost).** The
+   `out_pairs` buffer is sized generously to avoid overflow retries (e.g. ~786 MB for
+   the 8192-system batch), but the code was copying the *entire* buffer back to the CPU
+   every call regardless of how many pairs were actually found (typically a small
+   fraction of the buffer's capacity). Instrumented timing showed this readback at
+   80-320ms, dwarfing buffer upload (~30-45ms) and dispatch (~1ms). Fixed by
+   restructuring `dispatch()` into a **two-phase readback**: copy back only `out_count`
+   (4 bytes) first, then issue a second, right-sized copy for only the valid prefix of
+   `out_pairs`.
+
+Both fixes were verified to preserve correctness (`cargo test`, all 25 tests including
+`gpu_handles_dense_system_needing_retry`, still pass) before trusting the new numbers.
+
+**Benchmark after both fixes** (same shape as Phase 2's CPU-batched table, GPU column
+added):
+
+| batch_size | cpu_s (rayon) | gpu_s (wgpu) |
+|-----------:|--------------:|-------------:|
+|          8 |       0.00046 |      0.00091 |
+|         32 |       0.00211 |      0.00234 |
+|        128 |       0.01060 |      0.01072 |
+|        512 |       0.04889 |      0.04374 |
+|       2048 |       0.16857 |      0.16930 |
+|       8192 |       0.70559 |      0.75593 |
+
+**Interpretation:** the fixes closed what was a large and widening gap into
+near-parity — GPU is essentially tied with the CPU `rayon` path at every tested size
+(within ~10%), and briefly ahead at batch_size=512. It is *not*, however, decisively
+faster on this hardware/workload, unlike the CPU-vs-Vesin batched result in Phase 2.
+Remaining overhead is a fixed-latency cost, not a data-volume one: each `dispatch()`
+call still pays two full `submit()` + `poll(Wait)` round-trips (one for the count
+readback, one for the pairs readback), each measured at 10-40ms of synchronization
+latency regardless of payload size, plus per-call `create_buffer_init` uploads for all
+~8 input buffers since there is no persistent/resident-buffer reuse across calls (only
+the device/pipeline is cached via `OnceLock`, not the data buffers). The honest
+conclusion is **not** "`wgpu` is immature" (per project.md's fallback framing) — the
+API worked correctly and the shader logic was correct on the first real test run — but
+that this specific one-shot, non-resident-buffer call pattern pays synchronization
+overhead the CPU path simply doesn't have. A resident-buffer / persistent-session GPU
+API (reusing buffers across calls, amortizing upload and sync cost across many
+timesteps of an MD trajectory) is the natural next optimization if the GPU path is
+revisited, but is out of scope for closing out this task now given near-parity results
+and the higher-priority remaining Phase 3 work (Python bindings, MACE integration).
+
+<!-- Append further entries below as Phase 3 tasks proceed. -->
